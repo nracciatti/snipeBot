@@ -1,0 +1,32 @@
+# Browser sessions and authentication
+.playwright-profile/
+*playwright-profile*/
+
+# Runtime evidence, logs and cached event/session state
+artifacts/
+*.log
+*.pid
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local exports and OS/editor files
+*.zip
+*.bundle
+.DS_Store
+.idea/
+.vscode/
