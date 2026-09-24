@@ -59,6 +59,8 @@ class SafetyTests(unittest.TestCase):
                                         "title": "", "aria_label": "",
                                         "images": [{"src": "poster.png", "alt": "", "title": "",
                                                     "aria_label": ""}]}
+        info = anchor.evaluate.return_value
+        anchor.evaluate.side_effect = lambda script: ('' if script == main.CARD_EVIDENCE_JS else dict(info))
         anchor.bounding_box.return_value = {"width": 400, "height": 200}
         anchor.locator.return_value.all.return_value = []
         anchor.screenshot.return_value = b"png"
@@ -487,6 +489,69 @@ class SafetyTests(unittest.TestCase):
         frame.frame_element.return_value.is_visible.return_value = False
         self.assertEqual(main.classify(main.probe_page(page)), "QUEUE")
 
+
+
+
+
+class ParkingExclusionTests(unittest.TestCase):
+    def test_requested_examples(self):
+        for text, evidence, accepted in (
+            ('ESTACIONAMIENTO ARGENTINA VS BENIN', '', False),
+            ('PARKING ARGENTINA BENIN', '', False),
+            ('ARGENTINA C. BENIN AMISTOSO INTERNACIONAL', '', True),
+            ('ARGENTINA VS BENÍN', '', True),
+            ('Estacionamiento', '/event/argentina-benin', False),
+            ('Argentina vs Benin', 'Contexto padre: Estacionamiento', False),
+        ):
+            with self.subTest(text=text, evidence=evidence):
+                self.assertEqual(main.visual_card_match(text, evidence)['accepted'], accepted)
+
+    def test_every_card_source_overrides_countries(self):
+        for term in main.EXCLUDED_TARGET_TERMS:
+            for field in ('text', 'context', 'aria_label', 'title', 'href'):
+                card = {'text': 'Argentina vs Benín', field: term}
+                with self.subTest(term=term, field=field):
+                    self.assertFalse(main.home_target_verified(card))
+            for field in ('alt', 'title', 'aria_label', 'src', 'filename'):
+                card = {'text': 'Argentina vs Benín', 'images': [{field: term}]}
+                self.assertFalse(main.home_target_verified(card))
+            card = {'text': 'Argentina vs Benín', 'ancestors': [{'text': term, 'event_links': 1}]}
+            self.assertFalse(main.home_target_verified(card))
+
+    def test_final_card_guard_rejects_changed_parent_without_click(self):
+        anchor = MagicMock()
+        anchor.evaluate.return_value = 'Argentina vs Benin Estacionamiento'
+        with patch.object(main, 'log_watch') as log, patch.object(main, 'save_validated_event') as save:
+            self.assertFalse(main.enter_verified_card(MagicMock(), anchor,
+                             {'href': '/event/argentina-benin', 'ocr_text': 'Argentina vs Benin'}, 0))
+        anchor.click.assert_not_called()
+        save.assert_not_called()
+        self.assertIn('reason=parking_or_estacionamiento', log.call_args.args[0])
+
+    def test_hot_guard_blocks_late_metadata_change(self):
+        page, logger, locator = MagicMock(), MagicMock(), MagicMock()
+        url = 'https://www.deportick.com/event/argentina-benin'
+        data = {'url': url, 'title': 'Argentina vs Benin', 'buttons': [{'text': 'Comprar'}]}
+        locator.evaluate.return_value = 'Comprar parking'
+        with patch.object(main, 'probe_page', return_value=data), \
+             patch.object(main, 'hot_action_locator', return_value=(locator, 'Comprar')):
+            state, reason, _ = main.hot_step(page, url, logger, set())
+        self.assertEqual((state, reason), ('UNKNOWN', 'parking_or_estacionamiento'))
+        locator.click.assert_not_called()
+        logger.emit.assert_called_with('TARGET REJECTED | reason=parking_or_estacionamiento')
+
+    def test_saved_parking_target_is_invalid(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(main, 'ARTIFACTS', Path(folder)), \
+             patch.object(main, 'log_watch'):
+            (Path(folder) / 'target_event.json').write_text(json.dumps({
+                'verified': True, 'keywords': ['Argentina', 'Benin'],
+                'url': 'https://www.deportick.com/event/estacionamientosbenin'}))
+            self.assertIsNone(main.validated_event_url())
+
+    def test_event_exclusion_overrides_positive_heading(self):
+        data = {'title': 'Argentina vs Benin', 'body_text': 'ESTACIONAMIENTO OFICIAL'}
+        self.assertEqual(main.verify_event_identity(data), 'REJECTED')
+        self.assertFalse(main.event_identity_matches(data))
 
 
 if __name__ == "__main__":

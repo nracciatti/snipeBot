@@ -15,7 +15,7 @@ import time
 import unicodedata
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
@@ -288,6 +288,36 @@ def normalized(value):
     return " ".join(re.sub(r"[^\w]+", " ", plain).split())
 
 
+EXCLUDED_TARGET_TERMS = ("estacionamiento", "parking", "cochera", "garage", "estacionar")
+SPORT_SIGNALS = ("amistoso", "partido", "seleccion argentina", "fecha del partido", "estadio")
+
+
+def excluded_target(*evidence):
+    """Substring matching intentionally covers plural forms and joined URL slugs."""
+    text = unquote(" ".join(str(value or "") for value in evidence)).casefold()
+    return any(term in text for term in EXCLUDED_TARGET_TERMS)
+
+
+CARD_EVIDENCE_JS = """a => {
+  const parts = [];
+  const add = el => {
+    parts.push(el.innerText || '', ...[...el.attributes].map(x => x.value));
+  };
+  add(a);
+  a.querySelectorAll('*').forEach(add);
+  for (let p = a.parentElement; p && !p.matches('body,html'); p = p.parentElement) {
+    if (p.querySelectorAll('a[href*="/event/"]').length > 1) break;
+    add(p);
+    p.querySelectorAll('img,[aria-label],[title]').forEach(add);
+  }
+  return parts.join(' ');
+}"""
+
+
+def click_target_excluded(locator, *evidence):
+    return excluded_target(*evidence, locator.evaluate(CARD_EVIDENCE_JS))
+
+
 def edit_distance_at_most_one(left, right):
     if abs(len(left) - len(right)) > 1:
         return False
@@ -312,7 +342,11 @@ def visual_card_match(ocr_text, card_evidence=""):
     benin = benin_exact or (benin_fuzzy and (argentina or "benin" in evidence.split()))
     conflicting_rival = any(word in words for word in ("bolivia", "brasil", "burkina"))
     return {"match_argentina": argentina, "match_benin": benin,
-            "accepted": argentina and benin and not conflicting_rival}
+            "excluded": excluded_target(ocr_text, card_evidence),
+            "sport_score": sum(term in normalized(ocr_text + " " + card_evidence)
+                               for term in SPORT_SIGNALS),
+            "accepted": argentina and benin and not conflicting_rival
+            and not excluded_target(ocr_text, card_evidence)}
 
 
 def ensure_ocr_binary():
@@ -338,9 +372,10 @@ def ocr_card(png_bytes):
 
 
 def visual_scan_cards(page, cache, save_cards=False, stop_on_match=True):
-    """OCR each changed, visible event card; return the first verified card locator."""
+    """OCR changed cards and prefer sports signals among non-excluded matches."""
     anchors = page.locator('a[href*="/event/"]')
     reports = []
+    accepted = []
     signatures = []
     for index in range(anchors.count()):
         anchor = anchors.nth(index)
@@ -350,6 +385,7 @@ def visual_scan_cards(page, cache, save_cards=False, stop_on_match=True):
           images:[...a.querySelectorAll('img')].map(img => ({
             src:img.getAttribute('src') || '', alt:img.alt || '', title:img.title || '',
             aria_label:img.getAttribute('aria-label') || ''}))})""")
+        info["context"] = anchor.evaluate(CARD_EVIDENCE_JS)
         href = info.get("href") or ""
         sources = [image["src"] for image in info["images"]]
         signatures.append(href + "|" + "|".join(sources))
@@ -362,7 +398,7 @@ def visual_scan_cards(page, cache, save_cards=False, stop_on_match=True):
         if box["width"] > 1800 or box["height"] > 1400:
             continue
         signature = hashlib.sha256(json.dumps(
-            [href, sources, round(box["width"]), round(box["height"])],
+            [info, round(box["width"]), round(box["height"])],
             ensure_ascii=False).encode()).hexdigest()
         report = cache.get(signature)
         if report is None:
@@ -372,11 +408,11 @@ def visual_scan_cards(page, cache, save_cards=False, stop_on_match=True):
                     image.evaluate("img => img.decode().catch(() => {})")
             png = anchor.screenshot()
             ocr_text = ocr_card(png)
-            evidence = " ".join([href, info["text"], info["title"], info["aria_label"]] +
+            evidence = " ".join([href, info["text"], info["title"], info["aria_label"], str(info["context"])] +
                                 [" ".join(image.values()) for image in info["images"]])
             matches = visual_card_match(ocr_text, evidence)
             report = {"href": urljoin(page.url, href), "image_src": sources,
-                      "ocr_text": ocr_text, **matches, "signature": signature}
+                      "ocr_text": ocr_text, "evidence": evidence, **matches, "signature": signature}
             cache[signature] = report
             if save_cards:
                 folder = ARTIFACTS / "visual_scan"
@@ -386,8 +422,15 @@ def visual_scan_cards(page, cache, save_cards=False, stop_on_match=True):
                   "element": {"tag": "a", "text": info["text"], "id": None,
                               "role": None, "href": href, "data": {}}}
         reports.append(report)
-        if report["accepted"] and stop_on_match:
-            return reports, anchor, signatures
+        if report.get("excluded"):
+            log_watch("TARGET REJECTED | reason=parking_or_estacionamiento | URL=" + href)
+        if report["accepted"]:
+            accepted.append((report["sport_score"], anchor, report))
+    if accepted and stop_on_match:
+        _, anchor, report = max(accepted, key=lambda entry: entry[0])
+        reports.remove(report)
+        reports.append(report)
+        return reports, anchor, signatures
     return reports, None, signatures
 
 
@@ -395,6 +438,9 @@ def enter_verified_card(page, anchor, report, deadline):
     """Click the OCR-confirmed HOME anchor before writing files or normal logs."""
     detected_at = datetime.now().astimezone().isoformat(timespec="microseconds")
     target_url = report["href"]
+    if click_target_excluded(anchor, report):
+        log_watch("TARGET REJECTED | reason=parking_or_estacionamiento | URL=" + target_url)
+        return False
     try:
         anchor.click(timeout=5000, no_wait_after=True)
     except PlaywrightError as exc:
@@ -427,6 +473,8 @@ def enter_verified_card(page, anchor, report, deadline):
 
 
 def event_matches(value, keywords=EVENT_KEYWORDS):
+    if excluded_target(value):
+        return False
     required = {normalized(word) for word in keywords}
     candidate = normalized(value)
     return all(re.search(rf"(?<!\w){re.escape(word)}(?!\w)", candidate) for word in required)
@@ -440,7 +488,8 @@ def candidate_evidence(element):
                              if ancestor.get("event_links", 0) <= 1
                              for key in ("text", "headings", "data"))
     return " ".join((element.get("text", ""), element.get("context", ""),
-                     element.get("href", ""), element.get("aria_label", "") or "",
+                     element.get("href", ""), element.get("title", "") or "",
+                     element.get("aria_label", "") or "",
                      str(element.get("data", {})), str(element.get("parent_data", {})),
                      ancestor_text, image_text))
 
@@ -454,7 +503,7 @@ def home_target_verified(element):
 
 def argentina_candidate(element):
     evidence = normalized(candidate_evidence(element))
-    return "argentina" in evidence or bool(re.search(r"\barg\b", evidence))
+    return not excluded_target(evidence) and ("argentina" in evidence or bool(re.search(r"\barg\b", evidence)))
 
 
 def candidate_links(data, page_url):
@@ -477,6 +526,8 @@ def candidate_links(data, page_url):
 
 def verify_event_identity(data):
     """Confirm both teams within one title, heading, or short visible text block."""
+    if excluded_target(data):
+        return "REJECTED"
     blocks = [data.get("title", "")] + [x.get("text", "") for x in data.get("headings", [])]
     lines = [line.strip() for line in data.get("body_text", "").splitlines() if line.strip()]
     blocks += lines
@@ -623,6 +674,8 @@ def session_status(data):
 
 
 def event_identity_matches(data, keywords=("Argentina", "Benin")):
+    if excluded_target(data):
+        return False
     blocks = [data.get("title", "")] + [x.get("text", "") for x in data.get("headings", [])]
     return any(event_matches(block, keywords) for block in blocks)
 
@@ -718,11 +771,12 @@ def saved_locator(page, category):
 def event_link(page, data, event_url=None, keywords=EVENT_KEYWORDS):
     if event_url:
         for element in data.get("links", []):
-            if element.get("href") and urljoin(page.url, element["href"]) == event_url:
+            if (element.get("href") and urljoin(page.url, element["href"]) == event_url
+                    and not excluded_target(candidate_evidence(element))):
                 return unique_locator(page, element)
         return None
     saved = saved_locator(page, "event_card")
-    if saved and event_matches(saved.inner_text(), keywords):
+    if saved and event_matches(saved.inner_text(), keywords) and not click_target_excluded(saved):
         return saved
     matches = [element for element in data.get("links", [])
                if element.get("href") and "/event/" in element["href"]
@@ -774,11 +828,17 @@ def validated_event_url():
     if not path.exists():
         return None
     data = json.loads(path.read_text(encoding="utf-8"))
+    if excluded_target(data):
+        log_watch("TARGET REJECTED | reason=parking_or_estacionamiento | source=target_event.json")
+        return None
     return (data.get("url") if data.get("verified") is True and
             data.get("keywords") == ["Argentina", "Benin"] else None)
 
 
 def save_validated_event(url, evidence=None, verified_text=""):
+    if excluded_target(url, evidence, verified_text):
+        log_watch("TARGET REJECTED | reason=parking_or_estacionamiento")
+        return
     ARTIFACTS.mkdir(exist_ok=True)
     (ARTIFACTS / "target_event.json").write_text(
         json.dumps({"url": url, "keywords": ["Argentina", "Benin"], "verified": True,
@@ -1049,6 +1109,9 @@ def hot_step(page, target_url, logger, clicked_signatures, captcha_guard=None):
         return state, signal, data.get("hot_version")
     if data["url"].rstrip("/") != target_url.rstrip("/"):
         return "UNKNOWN", "navegación fuera del target confirmado", data.get("hot_version")
+    if excluded_target(target_url, data):
+        logger.emit("TARGET REJECTED | reason=parking_or_estacionamiento")
+        return "UNKNOWN", "parking_or_estacionamiento", data.get("hot_version")
     if verify_event_identity(data) == "REJECTED":
         return "UNKNOWN", "la URL confirmada muestra otro partido", data.get("hot_version")
     detected_at = datetime.now().astimezone().isoformat(timespec="microseconds")
@@ -1058,6 +1121,9 @@ def hot_step(page, target_url, logger, clicked_signatures, captcha_guard=None):
         locator, label = action
         signature = (data["url"], str(locator))
         if signature not in clicked_signatures:
+            if click_target_excluded(locator, target_url, data):
+                logger.emit("TARGET REJECTED | reason=parking_or_estacionamiento")
+                return "UNKNOWN", "parking_or_estacionamiento", data.get("hot_version")
             click_ns = time.perf_counter_ns()
             click_at = datetime.now().astimezone().isoformat(timespec="microseconds")
             try:
@@ -1422,7 +1488,10 @@ def presale_watch(sale_time, event_url=None, debug_watch=False):
                         keep_open()
                     if target_anchor:
                         queue_mode = "TARGET_VERIFIED"
-                        return enter_verified_card(page, target_anchor, reports[-1], deadline)
+                        result = enter_verified_card(page, target_anchor, reports[-1], deadline)
+                        if result is not False:
+                            return result
+                        queue_mode = "NONE"
                     save_home_diagnostics(data, ("Argentina", "Benin"))
                     if page.url == START_URL and time.monotonic() >= next_home_reload:
                         reason = "debug_validation" if debug_watch else "conservative_interval"
@@ -1538,6 +1607,9 @@ def watch(simulation=None, event_url=None, keywords=EVENT_KEYWORDS):
                         target = buy_locator(page, data)
                     signature = (data["url"], str(target))
                     if target and signature not in clicked:
+                        if click_target_excluded(target, data if state != "HOME" else ""):
+                            logger.emit("TARGET REJECTED | reason=parking_or_estacionamiento")
+                            continue
                         # No navigation/load wait: observe all safety states immediately.
                         target.click(timeout=5000, no_wait_after=True)
                         clicked.add(signature)
